@@ -10,18 +10,6 @@ class APIDisabledError(MwClientError):
     pass
 
 
-class HTTPError(MwClientError):
-    pass
-
-
-class HTTPStatusError(MwClientError):
-    pass
-
-
-class HTTPRedirectError(HTTPError):
-    pass
-
-
 class MaximumRetriesExceeded(MwClientError):
     pass
 
@@ -63,4 +51,8 @@ class EmailError(MwClientError):
 
 
 class NoSpecifiedEmail(EmailError):
+    pass
+
+
+class NoWriteApi(MwClientError):
     pass

@@ -1,25 +1,29 @@
-__ver__ = '0.6.6'
+__ver__ = '0.7.1dev'
 
+import warnings
 import urllib
-import urlparse
 import time
 import random
 import sys
 import weakref
-import socket
 import base64
+
+try:
+    # Python 2.7+
+    from collections import OrderedDict
+except ImportError:
+    # Python 2.6
+    from ordereddict import OrderedDict
 
 try:
     import json
 except ImportError:
     import simplejson as json
-import http
-import upload
+import requests
 
 import errors
 import listing
 import page
-import compatibility
 
 try:
     import gzip
@@ -81,7 +85,10 @@ class Site(object):
 
         # Setup connection
         if pool is None:
-            self.connection = http.HTTPPool(clients_useragent)
+            self.connection = requests.Session()
+            self.connection.headers['User-Agent'] = 'MwClient/' + __ver__ + ' (https://github.com/mwclient/mwclient)'
+            if clients_useragent:
+                self.connection.headers['User-Agent'] = clients_useragent + ' - ' + self.connection.headers['User-Agent']
         else:
             self.connection = pool
 
@@ -135,11 +142,12 @@ class Site(object):
                 raise errors.MediaWikiVersionError('Unknown MediaWiki %s' % '.'.join(version))
         else:
             raise errors.MediaWikiVersionError('Unknown generator %s' % self.site['generator'])
-        # Require 1.11 until some compatibility issues are fixed
-        self.require(1, 11)
+
+        # Require MediaWiki version >= 1.16
+        self.require(1, 16)
 
         # User info
-        userinfo = compatibility.userinfo(meta, self.require(1, 12, raise_error=False))
+        userinfo = meta['query']['userinfo']
         self.username = userinfo['name']
         self.groups = userinfo.get('groups', [])
         self.rights = userinfo.get('rights', [])
@@ -153,7 +161,23 @@ class Site(object):
         return "<Site object '%s%s'>" % (self.host, self.path)
 
     def api(self, action, *args, **kwargs):
-        """ An API call. Handles errors and returns dict object. """
+        """
+        Perform a generic API call and handle errors. All arguments will be passed on.
+
+        Example:
+            To get coordinates from the GeoData MediaWiki extension at English Wikipedia:
+
+            >>> site = Site('en.wikipedia.org')
+            >>> result = site.api('query', prop='coordinates', titles='Oslo|Copenhagen')
+            >>> for page in result['query']['pages'].values():
+            ...     if 'coordinates' in page:
+            ...         print page['title'], page['coordinates'][0]['lat'], page['coordinates'][0]['lon']
+            Oslo 59.95 10.75
+            Copenhagen 55.6761 12.5683
+
+        Returns:
+            The raw response from the API call, as a dictionary.
+        """
         kwargs.update(args)
         if action == 'query':
             if 'meta' in kwargs:
@@ -179,7 +203,7 @@ class Site(object):
             token = self.wait_token()
 
         try:
-            userinfo = compatibility.userinfo(info, self.require(1, 12, raise_error=None))
+            userinfo = info['query']['userinfo']
         except KeyError:
             userinfo = ()
         if 'blockedby' in userinfo:
@@ -189,7 +213,7 @@ class Site(object):
         self.hasmsg = 'message' in userinfo
         self.logged_in = 'anon' not in userinfo
         if 'error' in info:
-            if info['error']['code'] in (u'internal_api_error_DBConnectionError', ):
+            if info['error']['code'] in (u'internal_api_error_DBConnectionError', u'internal_api_error_DBQueryError'):
                 self.wait(token)
                 return False
             if '*' in info['error']:
@@ -200,25 +224,15 @@ class Site(object):
         return True
 
     @staticmethod
-    def _to_str(data):
-        if type(data) is unicode:
-            return data.encode('utf-8')
-        return str(data)
-
-    @staticmethod
     def _query_string(*args, **kwargs):
         kwargs.update(args)
-        qs = urllib.urlencode([(k, Site._to_str(v)) for k, v in kwargs.iteritems()
-                               if k != 'wpEditToken'])
-        if 'wpEditToken' in kwargs:
-            qs += '&wpEditToken=' + urllib.quote(Site._to_str(kwargs['wpEditToken']))
-        return qs
+        qs1 = [(k, v) for k, v in kwargs.iteritems() if k not in ('wpEditToken', 'token')]
+        qs2 = [(k, v) for k, v in kwargs.iteritems() if k in ('wpEditToken', 'token')]
+        return OrderedDict(qs1 + qs2)
 
-    def raw_call(self, script, data):
+    def raw_call(self, script, data, files=None):
         url = self.path + script + self.ext
         headers = {}
-        if not issubclass(data.__class__, upload.Upload):
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
         if self.compress and gzip:
             headers['Accept-Encoding'] = 'gzip'
         if self.httpauth is not None:
@@ -226,25 +240,30 @@ class Site(object):
             headers['Authorization'] = 'Basic %s' % credentials
         token = self.wait_token((script, data))
         while True:
-            try:
-                stream = self.connection.post(self.host,
-                                              url, data=data, headers=headers)
-                if stream.getheader('Content-Encoding') == 'gzip':
-                    # BAD.
-                    seekable_stream = StringIO(stream.read())
-                    stream = gzip.GzipFile(fileobj=seekable_stream)
-                return stream
+            scheme = 'http'  # Should we move to 'https' as default?
+            host = self.host
+            if type(host) is tuple:
+                scheme, host = host
 
-            except errors.HTTPStatusError, e:
+            fullurl = '{scheme}://{host}{url}'.format(scheme=scheme, host=host, url=url)
+
+            try:
+                stream = self.connection.post(fullurl, data=data, files=files, headers=headers)
+                return stream.text
+
+            except requests.exceptions.HTTPError, e:
+                print 'http error'
+                print e
                 if e[0] == 503 and e[1].getheader('X-Database-Lag'):
                     self.wait(token, int(e[1].getheader('Retry-After')))
                 elif e[0] < 500 or e[0] > 599:
                     raise
                 else:
                     self.wait(token)
-            except errors.HTTPRedirectError:
+            except requests.exceptions.TooManyRedirects:
                 raise
-            except errors.HTTPError:
+            except requests.exceptions.ConnectionError:
+                print 'connection error'
                 self.wait(token)
             except ValueError:
                 self.wait(token)
@@ -254,11 +273,12 @@ class Site(object):
         kwargs['action'] = action
         kwargs['format'] = 'json'
         data = self._query_string(*args, **kwargs)
-        json_data = self.raw_call('api', data).read()
+        res = self.raw_call('api', data)
+
         try:
-            return json.loads(json_data)
+            return json.loads(res)
         except ValueError:
-            if json_data.startswith('MediaWiki API is not enabled for this site.'):
+            if res.startswith('MediaWiki API is not enabled for this site.'):
                 raise errors.APIDisabledError
             raise
 
@@ -267,7 +287,7 @@ class Site(object):
         kwargs['action'] = action
         kwargs['maxlag'] = self.max_lag
         data = self._query_string(*args, **kwargs)
-        return self.raw_call('index', data).read().decode('utf-8', 'ignore')
+        return self.raw_call('index', data)
 
     def wait_token(self, args=None):
         token = WaitToken()
@@ -306,28 +326,42 @@ class Site(object):
 
     # Actions
     def email(self, user, text, subject, cc=False):
-        """Sends email to a specified user on the wiki."""
-        # TODO: Use api!
-        postdata = {}
-        postdata['wpSubject'] = subject
-        postdata['wpText'] = text
-        if cc:
-            postdata['wpCCMe'] = '1'
-        postdata['wpEditToken'] = self.tokens['edit']
-        postdata['uselang'] = 'en'
-        postdata['title'] = u'Special:Emailuser/' + user
+        """
+        Send email to a specified user on the wiki.
 
-        data = self.raw_index('submit', **postdata)
-        if 'var wgAction = "success";' not in data:
-            if 'This user has not specified a valid e-mail address' in data:
-                # Dirty hack
-                raise errors.NoSpecifiedEmailError, user
-            raise errors.EmailError, data
+            >>> try:
+            ...     site.email('SomeUser', 'Some message', 'Some subject')
+            ... except mwclient.errors.NoSpecifiedEmailError, e:
+            ...     print 'The user does not accept email, or has not specified an email address.'
+
+        Args:
+            user (str): User name of the recipient
+            text (str): Body of the email
+            subject (str): Subject of the email
+            cc (bool): True to send a copy of the email to yourself (default is False)
+
+        Returns:
+            Dictionary of the JSON response
+
+        Raises:
+            NoSpecifiedEmailError (mwclient.errors.NoSpecifiedEmailError): if recipient does not accept email
+            EmailError (mwclient.errors.EmailError): on other errors
+        """
+
+        token = self.get_token('email')
+
+        try:
+            info = self.api('emailuser', target=user, subject=subject,
+                            text=text, ccme=cc, token=token)
+        except errors.APIError, e:
+            if e[0] == u'noemail':
+                raise errors.NoSpecifiedEmail(user, e[1])
+            raise errors.EmailError(*e)
+
+        return info
 
     def login(self, username=None, password=None, cookies=None, domain=None):
         """Login to the wiki."""
-        if self.initialized:
-            self.require(1, 10)
 
         if username and password:
             self.credentials = (username, password, domain)
@@ -357,7 +391,7 @@ class Site(object):
 
         if self.initialized:
             info = self.api('query', meta='userinfo', uiprop='groups|rights')
-            userinfo = compatibility.userinfo(info, self.require(1, 12, raise_error=False))
+            userinfo = info['query']['userinfo']
             self.username = userinfo['name']
             self.groups = userinfo.get('groups', [])
             self.rights = userinfo.get('rights', [])
@@ -365,13 +399,76 @@ class Site(object):
         else:
             self.site_init()
 
+    def get_token(self, type, force=False, title=None):
+
+        if self.version[:2] >= (1, 24):
+            # The 'csrf' (cross-site request forgery) token introduced in 1.24 replaces
+            # the majority of older tokens, like edittoken and movetoken.
+            if type not in ['watch', 'patrol', 'rollback', 'userrights']:
+                type = 'csrf'
+
+        if type not in self.tokens:
+            self.tokens[type] = '0'
+
+        if self.tokens.get(type, '0') == '0' or force:
+
+            if self.version[:2] >= (1, 24):
+                info = self.api('query', meta='tokens', type=type)
+                self.tokens[type] = info['query']['tokens']['%stoken' % type]
+
+            else:
+                if title is None:
+                    # Some dummy title was needed to get a token prior to 1.24
+                    title = 'Test'
+                info = self.api('query', titles=title,
+                                prop='info', intoken=type)
+                for i in info['query']['pages'].itervalues():
+                    if i['title'] == title:
+                        self.tokens[type] = i['%stoken' % type]
+
+        return self.tokens[type]
+
     def upload(self, file=None, filename=None, description='', ignore=False, file_size=None,
-               url=None, session_key=None, comment=None):
-        """Upload a file to the wiki."""
-        if self.version[:2] < (1, 16):
-            return compatibility.old_upload(self, file=file, filename=filename,
-                                            description=description, ignore=ignore,
-                                            file_size=file_size)
+               url=None, filekey=None, comment=None):
+        """
+        Uploads a file to the site. Returns JSON result from the API.
+        Can raise `errors.InsufficientPermission` and `requests.exceptions.HTTPError`.
+
+        : Parameters :
+          - file         : File object or stream to upload.
+          - filename     : Destination filename, don't include namespace
+                           prefix like 'File:'
+          - description  : Wikitext for the file description page.
+          - ignore       : True to upload despite any warnings.
+          - file_size    : Deprecated in mwclient 0.7
+          - url          : URL to fetch the file from.
+          - filekey      : Key that identifies a previous upload that was
+                           stashed temporarily.
+          - comment      : Upload comment. Also used as the initial page text
+                           for new files if `description` is not specified.
+
+        Note that one of `file`, `filekey` and `url` must be specified, but not more
+        than one. For normal uploads, you specify `file`.
+
+        Example:
+
+        >>> client.upload(open('somefile', 'rb'), filename='somefile.jpg',
+                          description='Some description')
+        """
+
+        if file_size is not None:
+            # Note that DeprecationWarning is hidden by default since Python 2.7
+            warnings.warn(
+                'file_size is deprecated since mwclient 0.7',
+                DeprecationWarning
+            )
+            file_size = None
+
+        if filename is None:
+            raise TypeError('filename must be specified')
+
+        if len([x for x in [file, filekey, url] if x is not None]) != 1:
+            raise TypeError("exactly one of 'file', 'filekey' and 'url' must be specified")
 
         image = self.Images[filename]
         if not image.can('upload'):
@@ -393,41 +490,37 @@ class Site(object):
         predata['filename'] = filename
         if url:
             predata['url'] = url
-        if session_key:
-            predata['session_key'] = session_key
 
-        if file is None:
-            postdata = self._query_string(predata)
+        # Renamed from sessionkey to filekey
+        # https://git.wikimedia.org/commit/mediawiki%2Fcore.git/5f13517e
+        if self.version[:2] < (1, 18):
+            predata['sessionkey'] = filekey
         else:
-            if type(file) is str:
-                file_size = len(file)
-                file = StringIO(file)
-            if file_size is None:
-                file.seek(0, 2)
-                file_size = file.tell()
-                file.seek(0, 0)
+            predata['filekey'] = filekey
 
-            postdata = upload.UploadFile('file', filename, file_size, file, predata)
+        postdata = predata
+        files = None
+        if file is not None:
+            files = {'file': file}
 
         wait_token = self.wait_token()
         while True:
             try:
-                data = self.raw_call('api', postdata).read()
+                data = self.raw_call('api', postdata, files)
                 info = json.loads(data)
                 if not info:
                     info = {}
                 if self.handle_api_result(info, kwargs=predata):
                     return info.get('upload', {})
-            except errors.HTTPStatusError, e:
+            except requests.exceptions.HTTPError, e:
                 if e[0] == 503 and e[1].getheader('X-Database-Lag'):
                     self.wait(wait_token, int(e[1].getheader('Retry-After')))
                 elif e[0] < 500 or e[0] > 599:
                     raise
                 else:
                     self.wait(wait_token)
-            except errors.HTTPError:
+            except requests.exceptions.ConnectionError:
                 self.wait(wait_token)
-            file.seek(0, 0)
 
     def parse(self, text=None, title=None, page=None):
         kwargs = {}
@@ -440,17 +533,16 @@ class Site(object):
         result = self.api('parse', **kwargs)
         return result['parse']
 
-    # def block: requires 1.12
-    # def unblock: requires 1.12
-    # def patrol: requires 1.14
-    # def import: requires 1.15
+    # def block(self): TODO?
+    # def unblock: TODO?
+    # def patrol: TODO?
+    # def import: TODO?
 
     # Lists
     def allpages(self, start=None, prefix=None, namespace='0', filterredir='all',
                  minsize=None, maxsize=None, prtype=None, prlevel=None,
                  limit=None, dir='ascending', filterlanglinks='all', generator=True):
         """Retrieve all pages on the wiki as a generator."""
-        self.require(1, 9)
 
         pfx = listing.List.get_prefix('ap', generator)
         kwargs = dict(listing.List.generate_kwargs(pfx, ('from', start), prefix=prefix,
@@ -458,13 +550,21 @@ class Site(object):
                                                    namespace=namespace, filterredir=filterredir, dir=dir,
                                                    filterlanglinks=filterlanglinks))
         return listing.List.get_list(generator)(self, 'allpages', 'ap', limit=limit, return_values='title', **kwargs)
-    # def allimages(self): requires 1.12
-    # TODO!
+
+    def allimages(self, start=None, prefix=None, minsize=None, maxsize=None, limit=None,
+                  dir='ascending', sha1=None, sha1base36=None, prop='timestamp|url',
+                  generator=True):
+        """Retrieve all images on the wiki as a generator."""
+
+        pfx = listing.List.get_prefix('ai', generator)
+        kwargs = dict(listing.List.generate_kwargs(pfx, ('from', start), prefix=prefix,
+                                                   minsize=minsize, maxsize=maxsize,
+                                                   dir=dir, sha1=sha1, sha1base36=sha1base36))
+        return listing.List.get_list(generator)(self, 'allimages', 'ai', limit=limit, return_values='timestamp|url', **kwargs)
 
     def alllinks(self, start=None, prefix=None, unique=False, prop='title',
                  namespace='0', limit=None, generator=True):
         """Retrieve a list of all links on the wiki as a generator."""
-        self.require(1, 11)
 
         pfx = listing.List.get_prefix('al', generator)
         kwargs = dict(listing.List.generate_kwargs(pfx, ('from', start), prefix=prefix,
@@ -475,18 +575,21 @@ class Site(object):
 
     def allcategories(self, start=None, prefix=None, dir='ascending', limit=None, generator=True):
         """Retrieve all categories on the wiki as a generator."""
-        self.require(1, 12)
 
         pfx = listing.List.get_prefix('ac', generator)
         kwargs = dict(listing.List.generate_kwargs(pfx, ('from', start), prefix=prefix, dir=dir))
         return listing.List.get_list(generator)(self, 'allcategories', 'ac', limit=limit, **kwargs)
 
-    def allusers(self, start=None, prefix=None, group=None, prop=None, limit=None):
+    def allusers(self, start=None, prefix=None, group=None, prop=None, limit=None,
+                 witheditsonly=False, activeusers=False, rights=None):
         """Retrieve all users on the wiki as a generator."""
-        self.require(1, 11)
 
         kwargs = dict(listing.List.generate_kwargs('au', ('from', start), prefix=prefix,
-                                                   group=group, prop=prop))
+                                                   group=group, prop=prop,
+                                                   rights=rights,
+                                                   witheditsonly=witheditsonly,
+                                                   activeusers=activeusers))
+        print kwargs
         return listing.List(self, 'allusers', 'au', limit=limit, **kwargs)
 
     def blocks(self, start=None, end=None, dir='older', ids=None, users=None, limit=None,
@@ -505,7 +608,6 @@ class Site(object):
 
         """
 
-        self.require(1, 12)
         # TODO: Fix. Fix what?
         kwargs = dict(listing.List.generate_kwargs('bk', start=start, end=end, dir=dir,
                                                    users=users, prop=prop))
@@ -514,7 +616,6 @@ class Site(object):
     def deletedrevisions(self, start=None, end=None, dir='older', namespace=None,
                          limit=None, prop='user|comment'):
         # TODO: Fix
-        self.require(1, 12)
 
         kwargs = dict(listing.List.generate_kwargs('dr', start=start, end=end, dir=dir,
                                                    namespace=namespace, prop=prop))
@@ -538,7 +639,6 @@ class Site(object):
         - title: the page title.
 
         """
-        self.require(1, 11)
 
         kwargs = dict(listing.List.generate_kwargs('eu', query=query, prop=prop,
                                                    protocol=protocol, namespace=namespace))
@@ -546,7 +646,6 @@ class Site(object):
 
     def logevents(self, type=None, prop=None, start=None, end=None,
                   dir='older', user=None, title=None, limit=None, action=None):
-        self.require(1, 10)
 
         kwargs = dict(listing.List.generate_kwargs('le', prop=prop, type=type, start=start,
                                                    end=end, dir=dir, user=user, title=title, action=action))
@@ -562,21 +661,18 @@ class Site(object):
         Generator contains dictionary with namespace, page ID and title.
 
         """
-        self.require(1, 12)
 
         kwargs = dict(listing.List.generate_kwargs('rn', namespace=namespace))
         return listing.List(self, 'random', 'rn', limit=limit, **kwargs)
 
     def recentchanges(self, start=None, end=None, dir='older', namespace=None,
                       prop=None, show=None, limit=None, type=None):
-        self.require(1, 9)
 
         kwargs = dict(listing.List.generate_kwargs('rc', start=start, end=end, dir=dir,
                                                    namespace=namespace, prop=prop, show=show, type=type))
         return listing.List(self, 'recentchanges', 'rc', limit=limit, **kwargs)
 
     def search(self, search, namespace='0', what='title', redirects=False, limit=None):
-        self.require(1, 11)
 
         kwargs = dict(listing.List.generate_kwargs('sr', search=search, namespace=namespace, what=what))
         if redirects:
@@ -585,20 +681,17 @@ class Site(object):
 
     def usercontributions(self, user, start=None, end=None, dir='older', namespace=None,
                           prop=None, show=None, limit=None):
-        self.require(1, 9)
 
         kwargs = dict(listing.List.generate_kwargs('uc', user=user, start=start, end=end,
                                                    dir=dir, namespace=namespace, prop=prop, show=show))
         return listing.List(self, 'usercontribs', 'uc', limit=limit, **kwargs)
 
     def users(self, users, prop='blockinfo|groups|editcount'):
-        self.require(1, 12)
 
         return listing.List(self, 'users', 'us', ususers='|'.join(users), usprop=prop)
 
     def watchlist(self, allrev=False, start=None, end=None, namespace=None, dir='older',
                   prop=None, show=None, limit=None):
-        self.require(1, 9)
 
         kwargs = dict(listing.List.generate_kwargs('wl', start=start, end=end,
                                                    namespace=namespace, dir=dir, prop=prop, show=show))
@@ -608,7 +701,6 @@ class Site(object):
 
     def expandtemplates(self, text, title=None, generatexml=False):
         """Takes wikitext (text) and expands templates."""
-        self.require(1, 11)
 
         kwargs = {}
         if title is None:

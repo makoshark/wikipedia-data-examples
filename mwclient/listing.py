@@ -1,6 +1,5 @@
 import client
 import page
-import compatibility
 
 
 class List(object):
@@ -18,6 +17,8 @@ class List(object):
         if limit is None:
             limit = site.api_limit
         self.args[self.prefix + 'limit'] = str(limit)
+        if 'continue' not in self.args:
+            self.args['continue'] = ''
 
         self.count = 0
         self.max_items = max_items
@@ -63,8 +64,14 @@ class List(object):
             raise StopIteration
         self.set_iter(data)
 
-        if self.list_name in data.get('query-continue', ()):
+        if data.get('continue'):
+            # New style continuation, added in MediaWiki 1.21
+            self.args.update(data['continue'])
+
+        elif self.list_name in data.get('query-continue', ()):
+            # Old style continuation
             self.args.update(data['query-continue'][self.list_name])
+
         else:
             self.last = True
 
@@ -83,7 +90,7 @@ class List(object):
     def generate_kwargs(_prefix, *args, **kwargs):
         kwargs.update(args)
         for key, value in kwargs.iteritems():
-            if value is not None:
+            if value is not None and value is not False:
                 yield _prefix + key, value
 
     @staticmethod
@@ -128,7 +135,7 @@ class GeneratorList(List):
     def load_chunk(self):
         # Put this here so that the constructor does not fail
         # on uninitialized sites
-        self.args['iiprop'] = compatibility.iiprop(self.site.version)
+        self.args['iiprop'] = 'timestamp|user|comment|url|size|sha1|metadata|archivename'
         return List.load_chunk(self)
 
 
@@ -137,8 +144,7 @@ class Category(page.Page, GeneratorList):
     def __init__(self, site, name, info=None, namespace=None):
         page.Page.__init__(self, site, name, info)
         kwargs = {}
-        kwargs.update((compatibility.cmtitle(self, self.site.require(
-            1, 12, raise_error=False), prefix='gcm'), ))
+        kwargs['gcmtitle'] = self.name
         if namespace:
             kwargs['gcmnamespace'] = namespace
         GeneratorList.__init__(self, site, 'categorymembers', 'cm', **kwargs)
@@ -150,8 +156,7 @@ class Category(page.Page, GeneratorList):
                 dir='asc', start=None, end=None, generator=True):
         prefix = self.get_prefix('cm', generator)
         kwargs = dict(self.generate_kwargs(prefix, prop=prop, namespace=namespace,
-                                           sort=sort, dir=dir, start=start, end=end, *(compatibility.cmtitle(
-                                                                                       self, self.site.require(1, 12, raise_error=False)), )))
+                                           sort=sort, dir=dir, start=start, end=end, title=self.name))
         return self.get_list(generator)(self.site, 'categorymembers', 'cm', **kwargs)
 
 

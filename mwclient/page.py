@@ -1,12 +1,11 @@
 import client
 import errors
 import listing
-import compatibility
-from page_nowriteapi import OldPage
 
 import urllib
 import urlparse
 import time
+import warnings
 
 
 class Page(object):
@@ -97,73 +96,76 @@ class Page(object):
     def can(self, action):
         level = self.protection.get(action, (action, ))[0]
         if level == 'sysop':
-            level = compatibility.protectright(self.site.version)
+            level = 'editprotected'
 
         return level in self.site.rights
 
     def get_token(self, type, force=False):
-        self.site.require(1, 11)
-
-        if type not in self.site.tokens:
-            self.site.tokens[type] = '0'
-        if self.site.tokens.get(type, '0') == '0' or force:
-            info = self.site.api('query', titles=self.name,
-                                 prop='info', intoken=type)
-            for i in info['query']['pages'].itervalues():
-                if i['title'] == self.name:
-                    self.site.tokens[type] = i['%stoken' % type]
-        return self.site.tokens[type]
+        return self.site.get_token(type, force, title=self.name)
 
     def get_expanded(self):
-        self.site.require(1, 12)
+        """Deprecated. Use page.text(expandtemplates=True) instead"""
+        warnings.warn("page.get_expanded() was deprecated in mwclient 0.7.0, use page.text(expandtemplates=True) instead.",
+                      category=DeprecationWarning, stacklevel=2)
 
-        revs = self.revisions(prop='content', limit=1, expandtemplates=True)
-        try:
-            return revs.next()['*']
-        except StopIteration:
-            return u''
+        return self.text(expandtemplates=True)
 
-    def edit(self, section=None, readonly=False):
-        """Returns wikitext for a specified section or for the whole page.
+    def edit(self, *args, **kwargs):
+        """Deprecated. Use page.text() instead"""
+        warnings.warn("page.edit() was deprecated in mwclient 0.7.0, please use page.text() instead.",
+                      category=DeprecationWarning, stacklevel=2)
+        return self.text(*args, **kwargs)
 
-        Retrieves the latest edit.
-
+    def text(self, section=None, expandtemplates=False):
         """
+        Returns the current wikitext of the page, or of a specific section.
+        If the page does not exist, an empty string is returned.
+
+        :Arguments:
+          - `section` : numbered section or `None` to get the whole page (default: `None`)
+          - `expandtemplates` : set to `True` to expand templates (default: `False`)
+        """
+
         if not self.can('read'):
             raise errors.InsufficientPermission(self)
         if not self.exists:
             return u''
+        if section is not None:
+            section = str(section)
 
-        revs = self.revisions(prop='content|timestamp', limit=1, section=section)
+        revs = self.revisions(prop='content|timestamp', limit=1, section=section, expandtemplates=expandtemplates)
         try:
             rev = revs.next()
-            self.text = rev['*']
+            text = rev['*']
             self.section = section
             self.last_rev_time = rev['timestamp']
         except StopIteration:
-            self.text = u''
+            text = u''
             self.section = None
-            self.edit_time = None
-        self.edit_time = time.gmtime()
-        return self.text
+            self.last_rev_time = None
+        if not expandtemplates:
+            self.edit_time = time.gmtime()
+        return text
 
-    def save(self, text=u'', summary=u'', minor=False, bot=True, section=None, **kwargs):
-        """Save text of page."""
+    def save(self, text, summary=u'', minor=False, bot=True, section=None, **kwargs):
+        """
+        Update the text of a section or the whole page by performing an edit operation.
+        """
         if not self.site.logged_in and self.site.force_login:
             # Should we really check for this?
-            raise errors.LoginError(self.site)
+            raise errors.LoginError(self.site, 'By default, mwclient protects you from accidentally ' +
+                                    'editing without being logged in. If you actually want to edit without '
+                                    'logging in, you can set force_login on the Site object to False.')
         if self.site.blocked:
             raise errors.UserBlocked(self.site.blocked)
         if not self.can('edit'):
             raise errors.ProtectedPageError(self)
 
-        if not text:
-            text = self.text
         if not section:
             section = self.section
 
         if not self.site.writeapi:
-            return OldPage.save(self, text=text, summary=summary, minor=False)
+            raise errors.NoWriteApi(self)
 
         data = {}
         if minor:
@@ -201,8 +203,9 @@ class Page(object):
             else:
                 self.handle_edit_error(e, summary)
 
-        if result['edit'] == 'Success':
-            self.last_rev_time = client.parse_timestamp(result['newtimestamp'])
+        # 'newtimestamp' is not included if no change was made
+        if 'newtimestamp' in result['edit'].keys():
+            self.last_rev_time = client.parse_timestamp(result['edit'].get('newtimestamp'))
         return result['edit']
 
     def handle_edit_error(self, e, summary):
@@ -213,15 +216,6 @@ class Page(object):
             raise errors.ProtectedPageError(self, e.code, e.info)
         else:
             raise
-
-    def get_expanded(self):
-        self.site.require(1, 12)
-
-        revs = self.revisions(prop='content', limit=1, expandtemplates=True)
-        try:
-            return revs.next()['*']
-        except StopIteration:
-            return u''
 
     def move(self, new_title, reason='', move_talk=True, no_redirect=False):
         """Move (rename) page to new_title.
@@ -237,8 +231,7 @@ class Page(object):
             raise errors.InsufficientPermission(self)
 
         if not self.site.writeapi:
-            return OldPage.move(self, new_title=new_title,
-                                reason=reason, move_talk=move_talk)
+            raise errors.NoWriteApi(self)
 
         data = {}
         if move_talk:
@@ -260,7 +253,7 @@ class Page(object):
             raise errors.InsufficientPermission(self)
 
         if not self.site.writeapi:
-            return OldPage.delete(self, reason=reason)
+            raise errors.NoWriteApi(self)
 
         data = {}
         if watch:
@@ -285,19 +278,16 @@ class Page(object):
 
     # Properties
     def backlinks(self, namespace=None, filterredir='all', redirect=False, limit=None, generator=True):
-        self.site.require(1, 9)
-        # Fix title for < 1.11 !!
         prefix = listing.List.get_prefix('bl', generator)
         kwargs = dict(listing.List.generate_kwargs(prefix,
                                                    namespace=namespace, filterredir=filterredir))
         if redirect:
             kwargs['%sredirect' % prefix] = '1'
-        kwargs[compatibility.title(prefix, self.site.require(1, 11, raise_error=False))] = self.name
+        kwargs[prefix + 'title'] = self.name
 
         return listing.List.get_list(generator)(self.site, 'backlinks', 'bl', limit=limit, return_values='title', **kwargs)
 
     def categories(self, generator=True):
-        self.site.require(1, 11)
         if generator:
             return listing.PagePropertyGenerator(self, 'categories', 'cl')
         else:
@@ -305,38 +295,31 @@ class Page(object):
             return listing.PageProperty(self, 'categories', 'cl', return_values='title')
 
     def embeddedin(self, namespace=None, filterredir='all', redirect=False, limit=None, generator=True):
-        self.site.require(1, 9)
-        # Fix title for < 1.11 !!
         prefix = listing.List.get_prefix('ei', generator)
         kwargs = dict(listing.List.generate_kwargs(prefix,
                                                    namespace=namespace, filterredir=filterredir))
         if redirect:
             kwargs['%sredirect' % prefix] = '1'
-        kwargs[compatibility.title(prefix, self.site.require(1, 11, raise_error=False))] = self.name
+        kwargs[prefix + 'title'] = self.name
 
         return listing.List.get_list(generator)(self.site, 'embeddedin', 'ei', limit=limit, return_values='title', **kwargs)
 
     def extlinks(self):
-        self.site.require(1, 11)
         return listing.PageProperty(self, 'extlinks', 'el', return_values='*')
 
     def images(self, generator=True):
-        self.site.require(1, 9)
         if generator:
             return listing.PagePropertyGenerator(self, 'images', '')
         else:
             return listing.PageProperty(self, 'images', '', return_values='title')
 
     def iwlinks(self):
-        self.site.require(1, 9)  # guessing...
         return listing.PageProperty(self, 'iwlinks', 'iw', return_values=('prefix', '*'))
 
     def langlinks(self, **kwargs):
-        self.site.require(1, 9)
         return listing.PageProperty(self, 'langlinks', 'll', return_values=('lang', '*'), **kwargs)
 
     def links(self, namespace=None, generator=True, redirects=False):
-        self.site.require(1, 9)
         kwargs = dict(listing.List.generate_kwargs('pl', namespace=namespace))
         if redirects:
             kwargs['redirects'] = '1'
@@ -348,20 +331,18 @@ class Page(object):
     def revisions(self, startid=None, endid=None, start=None, end=None,
                   dir='older', user=None, excludeuser=None, limit=50,
                   prop='ids|timestamp|flags|comment|user', expandtemplates=False, section=None):
-        self.site.require(1, 8)
         kwargs = dict(listing.List.generate_kwargs('rv', startid=startid, endid=endid,
                                                    start=start, end=end, user=user, excludeuser=excludeuser))
         kwargs['rvdir'] = dir
         kwargs['rvprop'] = prop
         if expandtemplates:
             kwargs['rvexpandtemplates'] = '1'
-        if section:
+        if section is not None:
             kwargs['rvsection'] = section
 
         return listing.RevisionsIterator(self, 'revisions', 'rv', limit=limit, **kwargs)
 
     def templates(self, namespace=None, generator=True):
-        self.site.require(1, 8)
         kwargs = dict(listing.List.generate_kwargs('tl', namespace=namespace))
         if generator:
             return listing.PagePropertyGenerator(self, 'templates', 'tl')
@@ -372,21 +353,19 @@ class Page(object):
 class Image(Page):
 
     def __init__(self, site, name, info=None):
-        site.require(1, 11)
         Page.__init__(self, site, name, info,
-                      extra_properties={'imageinfo': (('iiprop',
-                                                       compatibility.iiprop(site.version)), )})
+                      extra_properties={'imageinfo':
+                                        (('iiprop', 'timestamp|user|comment|url|size|sha1|metadata|archivename'), )
+                                        })
         self.imagerepository = self._info.get('imagerepository', '')
         self.imageinfo = self._info.get('imageinfo', ({}, ))[0]
 
     def imagehistory(self):
         return listing.PageProperty(self, 'imageinfo', 'ii',
-                                    iiprop=compatibility.iiprop(self.site.version))
+                                    iiprop='timestamp|user|comment|url|size|sha1|metadata|archivename')
 
     def imageusage(self, namespace=None, filterredir='all', redirect=False,
                    limit=None, generator=True):
-        self.site.require(1, 11)
-        # TODO: Fix for versions < 1.11
         prefix = listing.List.get_prefix('iu', generator)
         kwargs = dict(listing.List.generate_kwargs(prefix, title=self.name,
                                                    namespace=namespace, filterredir=filterredir))
@@ -396,7 +375,6 @@ class Image(Page):
                                                 limit=limit, return_values='title', **kwargs)
 
     def duplicatefiles(self, limit=None):
-        self.require(1, 14)
         return listing.PageProperty(self, 'duplicatefiles', 'df',
                                     dflimit=limit)
 

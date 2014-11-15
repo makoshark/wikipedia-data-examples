@@ -1,5 +1,5 @@
 import time
-import simplejson as json
+import json
 import mwclient
 
 def format_time(t):
