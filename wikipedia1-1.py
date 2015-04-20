@@ -1,6 +1,6 @@
 import requests
 
-wp_call = requests.get('https://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=Main_Page&rvlimit=100&rvprop=timestamp|user&format=json')
+wp_call = requests.get('https://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=Python_(programming_language)&rvlimit=100&rvprop=timestamp|user&continue=&format=json')
 
 response = wp_call.json()
 
