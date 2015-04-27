@@ -12,7 +12,6 @@ parameters = {'action' : 'query',
               'format' : 'json',
               'continue' : ''}
 
-# run a white true loop
 while True:
     wp_call = requests.get('https://en.wikipedia.org/w/api.php', params=parameters)
     response = wp_call.json()
