@@ -1,3 +1,4 @@
+import encoding_fix
 import requests
 
 wp_call = requests.get('https://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=Python_(programming_language)&rvlimit=100&rvprop=timestamp|user&continue=&format=json')

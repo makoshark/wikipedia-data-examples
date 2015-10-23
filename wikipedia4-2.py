@@ -1,3 +1,4 @@
+import encoding_fix
 import requests
 
 # ?action=query&titles=Albert%20Einstein&prop=categories

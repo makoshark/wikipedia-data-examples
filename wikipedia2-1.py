@@ -1,3 +1,4 @@
+import encoding_fix
 import requests
 
 url_base = 'https://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=%s&rvlimit=100&rvprop=timestamp|user&continue=&format=json'

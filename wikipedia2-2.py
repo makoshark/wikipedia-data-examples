@@ -1,3 +1,4 @@
+import encoding_fix
 import requests
 
 # base url:
